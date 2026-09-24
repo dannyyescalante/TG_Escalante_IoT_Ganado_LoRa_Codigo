@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Environment variables (secrets, credenciales de DB, etc.)
+.env
+.env.local
+.env.*.local
+
+# Build output
+dist/
+build/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Claude Code - configuracion y datos locales del asistente (no se sube al repo)
+.claude/
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
