@@ -1,4 +1,5 @@
 import { pool } from "../config/database";
+import { sendGeofenceExitAlert } from "./telegramNotifier";
 
 export type GeofenceEventType = "exit" | "enter";
 
@@ -75,6 +76,22 @@ export async function evaluateGeofenceTransition(
          RETURNING *`,
         [animalId, locationId, eventTypeToInsert, recordedAt]
     );
+    const event: GeofenceEvent = insertResult.rows[0];
 
-    return insertResult.rows[0];
+    if (eventTypeToInsert === "exit") {
+        const animalResult = await pool.query(
+            "SELECT tag_number, name FROM animals WHERE id = $1",
+            [animalId]
+        );
+        const animal = animalResult.rows[0];
+
+        // Sin await: RNF1 exige que esto no retrase la respuesta de POST /locations.
+        void sendGeofenceExitAlert({
+            tagNumber: animal.tag_number,
+            animalName: animal.name,
+            occurredAt: recordedAt,
+        });
+    }
+
+    return event;
 }
