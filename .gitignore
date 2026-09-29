@@ -10,6 +10,11 @@ node_modules/
 dist/
 build/
 
+# PlatformIO (firmware/)
+.pio/
+.pioenvs/
+.piolibdeps/
+
 # Logs
 *.log
 npm-debug.log*
