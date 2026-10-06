@@ -6,6 +6,9 @@ node_modules/
 .env.local
 .env.*.local
 
+# Credenciales locales del firmware (WiFi, URL del backend); se versiona solo secrets.example.h
+secrets.h
+
 # Build output
 dist/
 build/
