@@ -12,10 +12,17 @@ static const int I2C_SDA_PIN = 21;
 static const int I2C_SCL_PIN = 22;
 static const uint32_t HEARTBEAT_INTERVAL_MS = 30000;
 
-// Timeouts cortos: mientras dura el POST la base no procesa paquetes LoRa nuevos.
+// Timeouts cortos: mientras dura un POST la base no procesa paquetes LoRa nuevos.
 static const int32_t HTTP_CONNECT_TIMEOUT_MS = 2000;
 static const uint16_t HTTP_RESPONSE_TIMEOUT_MS = 3000;
 static const size_t RESPONSE_LOG_MAX_CHARS = 200;
+
+// Cola de reenvio al backend: si el POST falla por red/backend, se reintenta en orden.
+static const uint16_t QUEUE_CAPACITY = 500;
+static const uint32_t POST_RETRY_INTERVAL_MS = 10000;
+
+// Duplicados: ultimo registro aceptado de cada collar (reintentos por ACK perdido).
+static const uint8_t MAX_TRACKED_COLLARS = 16;
 
 XPowersLibInterface *pmu = nullptr;
 SX1276 radio = new Module(LORA_CS_PIN, LORA_DIO0_PIN, LORA_RST_PIN, LORA_DIO1_PIN);
@@ -24,20 +31,42 @@ volatile bool radioIrq = false;
 bool radioReady = false;
 bool wifiWasConnected = false;
 uint32_t lastHeartbeatMs = 0;
+uint32_t nextPostAttemptMs = 0;
 
 uint32_t packetsAccepted = 0;
 uint32_t packetsRejected = 0;
 uint32_t packetsDuplicated = 0;
 uint32_t postsOk = 0;
-uint32_t postsFailed = 0;
+uint32_t postsRetried = 0;
+uint32_t postsDiscarded = 0;
+uint32_t queueDropped = 0;
 
-// Ultimo paquete aceptado: si llega otro igual es un reintento del collar porque se perdio el ACK.
-bool hasLastPacket = false;
-char lastCollarId[COLLAR_ID_LEN] = {};
-uint16_t lastSeq = 0;
-uint32_t lastTimestamp = 0;
+struct CollarLastSeen {
+    bool used;
+    char collarId[COLLAR_ID_LEN];
+    uint16_t seq;
+    uint32_t timestamp;
+};
+CollarLastSeen lastSeen[MAX_TRACKED_COLLARS] = {};
+uint8_t nextLastSeenSlot = 0;
+
+struct QueuedReading {
+    char collarId[COLLAR_ID_LEN + 1];
+    uint16_t seq;
+    int32_t latE6;
+    int32_t lonE6;
+    uint32_t timestamp;
+    uint8_t satellites;
+    uint8_t batteryPercent;
+    float rssi;  // medidos por esta base al recibir (OE4: alcance del enlace)
+    float snr;
+};
+QueuedReading queue[QUEUE_CAPACITY];
+uint16_t queueHead = 0;
+uint16_t queueCount = 0;
 
 enum PacketResult { PACKET_REJECTED, PACKET_DUPLICATE, PACKET_NEW };
+enum PostResult { POST_OK, POST_DISCARD, POST_RETRY };
 
 void IRAM_ATTR onRadioIrq() {
     radioIrq = true;
@@ -92,9 +121,32 @@ void formatTimestamp(uint32_t epoch, const char *format, char *out, size_t outSi
     strftime(out, outSize, format, &utc);
 }
 
+// v1 (33 bytes, sin bateria) se convierte a la forma v2 con bateria desconocida.
+bool parseDataPacket(const uint8_t *buffer, size_t length, DataPacket &data) {
+    if (length == sizeof(DataPacket) && buffer[0] == PROTOCOL_VERSION) {
+        memcpy(&data, buffer, sizeof(data));
+        return true;
+    }
+    if (length == sizeof(DataPacketV1) && buffer[0] == PROTOCOL_VERSION_V1) {
+        DataPacketV1 v1;
+        memcpy(&v1, buffer, sizeof(v1));
+        data.version = v1.version;
+        data.type = v1.type;
+        data.seq = v1.seq;
+        memcpy(data.collarId, v1.collarId, COLLAR_ID_LEN);
+        data.latE6 = v1.latE6;
+        data.lonE6 = v1.lonE6;
+        data.timestamp = v1.timestamp;
+        data.satellites = v1.satellites;
+        data.batteryPercent = BATTERY_UNKNOWN;
+        return true;
+    }
+    return false;
+}
+
 bool sendAck(const DataPacket &data) {
     AckPacket ack = {};
-    ack.version = PROTOCOL_VERSION;
+    ack.version = data.version;  // misma version recibida: un collar v1 acepta el ACK
     ack.type = MSG_TYPE_ACK;
     ack.seq = data.seq;
     memcpy(ack.collarId, data.collarId, COLLAR_ID_LEN);
@@ -109,7 +161,62 @@ bool sendAck(const DataPacket &data) {
     return true;
 }
 
-PacketResult receivePacket(DataPacket &data) {
+// Mismo seq y timestamp que el ultimo registro de ese collar = reintento por ACK perdido.
+// Comparar el timestamp evita confundir un registro nuevo si el seq del collar se reinicio.
+bool isDuplicateAndRemember(const DataPacket &data) {
+    for (uint8_t i = 0; i < MAX_TRACKED_COLLARS; i++) {
+        CollarLastSeen &entry = lastSeen[i];
+        if (!entry.used || memcmp(entry.collarId, data.collarId, COLLAR_ID_LEN) != 0) continue;
+        if (entry.seq == data.seq && entry.timestamp == data.timestamp) return true;
+        entry.seq = data.seq;
+        entry.timestamp = data.timestamp;
+        return false;
+    }
+
+    CollarLastSeen *slot = nullptr;
+    for (uint8_t i = 0; i < MAX_TRACKED_COLLARS && !slot; i++) {
+        if (!lastSeen[i].used) slot = &lastSeen[i];
+    }
+    if (!slot) {
+        slot = &lastSeen[nextLastSeenSlot];
+        nextLastSeenSlot = (nextLastSeenSlot + 1) % MAX_TRACKED_COLLARS;
+    }
+    slot->used = true;
+    memcpy(slot->collarId, data.collarId, COLLAR_ID_LEN);
+    slot->seq = data.seq;
+    slot->timestamp = data.timestamp;
+    return false;
+}
+
+void enqueue(const DataPacket &data, float rssi, float snr) {
+    if (queueCount == QUEUE_CAPACITY) {
+        // Cola llena: se descarta el registro mas antiguo.
+        Serial.printf("  cola      : llena, se descarta el mas antiguo (%s ts=%lu)\n", queue[queueHead].collarId,
+                      (unsigned long)queue[queueHead].timestamp);
+        queueHead = (queueHead + 1) % QUEUE_CAPACITY;
+        queueCount--;
+        queueDropped++;
+    }
+
+    QueuedReading &item = queue[(queueHead + queueCount) % QUEUE_CAPACITY];
+    collarIdToString(data, item.collarId);
+    item.seq = data.seq;
+    item.latE6 = data.latE6;
+    item.lonE6 = data.lonE6;
+    item.timestamp = data.timestamp;
+    item.satellites = data.satellites;
+    item.batteryPercent = data.batteryPercent;
+    item.rssi = rssi;
+    item.snr = snr;
+    queueCount++;
+}
+
+void dequeueOldest() {
+    queueHead = (queueHead + 1) % QUEUE_CAPACITY;
+    queueCount--;
+}
+
+PacketResult receivePacket() {
     uint8_t buffer[256];
     size_t length = radio.getPacketLength();
     int16_t state = radio.readData(buffer, length);
@@ -123,17 +230,18 @@ PacketResult receivePacket(DataPacket &data) {
         Serial.printf("Paquete descartado: error de recepcion (codigo %d; -7 = CRC invalido)\n", state);
         return PACKET_REJECTED;
     }
-    if (length != sizeof(DataPacket)) {
+
+    DataPacket data;
+    if (!parseDataPacket(buffer, length, data)) {
         packetsRejected++;
-        Serial.printf("Paquete descartado: tamano %u bytes (se esperaban %u)\n",
-                      (unsigned)length, (unsigned)sizeof(DataPacket));
+        Serial.printf("Paquete descartado: %u bytes, version %u (se aceptan v%u de %u bytes y v%u de %u bytes)\n",
+                      (unsigned)length, length > 0 ? buffer[0] : 0, PROTOCOL_VERSION_V1,
+                      (unsigned)sizeof(DataPacketV1), PROTOCOL_VERSION, (unsigned)sizeof(DataPacket));
         return PACKET_REJECTED;
     }
-
-    memcpy(&data, buffer, sizeof(data));
-    if (data.version != PROTOCOL_VERSION || data.type != MSG_TYPE_DATA) {
+    if (data.type != MSG_TYPE_DATA) {
         packetsRejected++;
-        Serial.printf("Paquete descartado: version %u / tipo 0x%02X no soportados\n", data.version, data.type);
+        Serial.printf("Paquete descartado: tipo 0x%02X no soportado\n", data.type);
         return PACKET_REJECTED;
     }
 
@@ -145,70 +253,71 @@ PacketResult receivePacket(DataPacket &data) {
         return PACKET_REJECTED;
     }
 
-    // El ACK va primero: el collar solo lo espera ACK_TIMEOUT_MS.
+    // El ACK va primero: el collar solo lo espera ACK_TIMEOUT_MS. El ACK significa
+    // "la base lo recibio"; el reenvio al backend lo garantiza la cola de la base.
     bool ackSent = sendAck(data);
 
-    // Mismo seq y timestamp = reintento del mismo paquete. Comparar tambien el timestamp evita
-    // tomar como duplicado un paquete nuevo si el collar se reinicio y su seq volvio a empezar.
-    bool duplicate = hasLastPacket && data.seq == lastSeq && data.timestamp == lastTimestamp &&
-                     memcmp(data.collarId, lastCollarId, COLLAR_ID_LEN) == 0;
+    bool duplicate = isDuplicateAndRemember(data);
     if (duplicate) {
         packetsDuplicated++;
     } else {
         packetsAccepted++;
-        hasLastPacket = true;
-        memcpy(lastCollarId, data.collarId, COLLAR_ID_LEN);
-        lastSeq = data.seq;
-        lastTimestamp = data.timestamp;
+        enqueue(data, rssi, snr);
     }
 
     char timeText[24];
     formatTimestamp(data.timestamp, "%Y-%m-%d %H:%M:%S", timeText, sizeof(timeText));
 
     Serial.println("========================================");
-    Serial.printf("Paquete recibido%s (%u bytes)\n", duplicate ? " [DUPLICADO - reintento del collar]" : "",
-                  (unsigned)length);
+    Serial.printf("Paquete recibido v%u%s (%u bytes)\n", data.version,
+                  duplicate ? " [DUPLICADO - reintento del collar]" : "", (unsigned)length);
     Serial.printf("  collar_id : %s\n", collarId);
     Serial.printf("  seq       : %u\n", data.seq);
     Serial.printf("  lat / lon : %.6f, %.6f\n", data.latE6 / 1e6, data.lonE6 / 1e6);
     Serial.printf("  timestamp : %lu (%s UTC)\n", (unsigned long)data.timestamp, timeText);
     Serial.printf("  satelites : %u\n", data.satellites);
+    if (data.batteryPercent == BATTERY_UNKNOWN) {
+        Serial.println("  bateria   : sin dato");
+    } else {
+        Serial.printf("  bateria   : %u%%\n", data.batteryPercent);
+    }
     Serial.printf("  RSSI      : %.1f dBm | SNR: %.1f dB | error de frecuencia: %.0f Hz\n",
                   rssi, snr, frequencyError);
     Serial.printf("  ACK       : %s\n", ackSent ? "enviado" : "FALLO");
-    Serial.printf("  totales   : aceptados %lu | duplicados %lu | descartados %lu\n",
-                  (unsigned long)packetsAccepted, (unsigned long)packetsDuplicated,
-                  (unsigned long)packetsRejected);
+    Serial.printf("  cola      : %s (pendientes %u/%u)\n", duplicate ? "omitido (DUPLICADO)" : "encolado",
+                  queueCount, QUEUE_CAPACITY);
 
     return duplicate ? PACKET_DUPLICATE : PACKET_NEW;
 }
 
-// Un solo intento: si falla, el punto se pierde (sin reintentos, cola ni almacenamiento).
-void forwardToBackend(const DataPacket &data) {
-    if (WiFi.status() != WL_CONNECTED) {
-        postsFailed++;
-        Serial.println("  POST      : omitido, WiFi desconectado (se descarta)");
-        return;
+// Un intento por llamada. 201 = guardado; 200 = ya estaba guardado (p. ej. un intento anterior
+// que dio timeout si llego al backend): tambien es exito. 400/404 = el backend lo rechazaria
+// siempre (se descarta para no trabar la cola); cualquier otro fallo = se reintenta.
+PostResult postReading(const QueuedReading &item) {
+    char isoTimestamp[24];
+    formatTimestamp(item.timestamp, "%Y-%m-%dT%H:%M:%SZ", isoTimestamp, sizeof(isoTimestamp));
+
+    char battery[8];
+    if (item.batteryPercent == BATTERY_UNKNOWN) {
+        strcpy(battery, "null");
+    } else {
+        snprintf(battery, sizeof(battery), "%u", item.batteryPercent);
     }
 
-    char collarId[COLLAR_ID_LEN + 1];
-    collarIdToString(data, collarId);
-    char isoTimestamp[24];
-    formatTimestamp(data.timestamp, "%Y-%m-%dT%H:%M:%SZ", isoTimestamp, sizeof(isoTimestamp));
-
     // Mismos nombres y tipos que valida POST /locations: lat/lon como numero, timestamp ISO 8601.
-    char body[160];
+    char body[300];
     snprintf(body, sizeof(body),
-             "{\"collar_device_id\":\"%s\",\"lat\":%.6f,\"lon\":%.6f,\"timestamp\":\"%s\"}",
-             collarId, data.latE6 / 1e6, data.lonE6 / 1e6, isoTimestamp);
+             "{\"collar_device_id\":\"%s\",\"lat\":%.6f,\"lon\":%.6f,\"timestamp\":\"%s\",\"battery_percent\":%s,"
+             "\"satellites\":%u,\"packet_seq\":%u,\"rssi\":%.1f,\"snr\":%.2f}",
+             item.collarId, item.latE6 / 1e6, item.lonE6 / 1e6, isoTimestamp, battery, item.satellites, item.seq,
+             item.rssi, item.snr);
 
     HTTPClient http;
     http.setConnectTimeout(HTTP_CONNECT_TIMEOUT_MS);
     http.setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
     if (!http.begin(BACKEND_URL)) {
-        postsFailed++;
-        Serial.println("  POST      : ERROR, BACKEND_URL invalida en secrets.h (se descarta)");
-        return;
+        Serial.println("POST: ERROR, BACKEND_URL invalida en secrets.h");
+        return POST_RETRY;
     }
     http.addHeader("Content-Type", "application/json");
 
@@ -217,11 +326,10 @@ void forwardToBackend(const DataPacket &data) {
     uint32_t elapsedMs = millis() - startMs;
 
     if (code <= 0) {
-        postsFailed++;
-        Serial.printf("  POST      : ERROR %s en %lu ms (se descarta)\n",
+        Serial.printf("POST [%s seq=%u]: ERROR %s en %lu ms\n", item.collarId, item.seq,
                       HTTPClient::errorToString(code).c_str(), (unsigned long)elapsedMs);
         http.end();
-        return;
+        return POST_RETRY;
     }
 
     String response = http.getString();
@@ -230,14 +338,33 @@ void forwardToBackend(const DataPacket &data) {
         response = response.substring(0, RESPONSE_LOG_MAX_CHARS) + "...";
     }
 
-    if (code == 201) {
-        postsOk++;
-        Serial.printf("  POST      : 201 Created en %lu ms | %s\n", (unsigned long)elapsedMs, response.c_str());
-    } else {
-        postsFailed++;
-        Serial.printf("  POST      : %d en %lu ms (se descarta) | %s\n", code, (unsigned long)elapsedMs,
-                      response.c_str());
+    Serial.printf("POST [%s seq=%u]: %d en %lu ms | %s\n", item.collarId, item.seq, code,
+                  (unsigned long)elapsedMs, response.c_str());
+    if (code == 201 || code == 200) return POST_OK;
+    if (code == 400 || code == 404) return POST_DISCARD;
+    return POST_RETRY;
+}
+
+void processQueue() {
+    if (queueCount == 0 || WiFi.status() != WL_CONNECTED) return;
+    if ((int32_t)(millis() - nextPostAttemptMs) < 0) return;
+
+    PostResult result = postReading(queue[queueHead]);
+    if (result == POST_RETRY) {
+        postsRetried++;
+        nextPostAttemptMs = millis() + POST_RETRY_INTERVAL_MS;
+        Serial.printf("  -> queda en la cola, se reintenta en %lu s (pendientes %u)\n",
+                      (unsigned long)(POST_RETRY_INTERVAL_MS / 1000), queueCount);
+        return;
     }
+
+    if (result == POST_OK) {
+        postsOk++;
+    } else {
+        postsDiscarded++;
+        Serial.println("  -> el backend lo rechaza: se descarta de la cola");
+    }
+    dequeueOldest();
 }
 
 void logWifiChanges() {
@@ -257,7 +384,7 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
     Serial.println();
-    Serial.println("Estacion base IoT - Parte 3: recepcion LoRa + reenvio HTTP al backend");
+    Serial.println("Estacion base IoT - recepcion LoRa (v1/v2) + cola de reenvio HTTP al backend");
 
     if (!powerOnRadio()) {
         Serial.println("ATENCION: no se detecto PMU (AXP2101/AXP192); la radio podria no estar alimentada");
@@ -293,26 +420,22 @@ void loop() {
 
     if (radioIrq) {
         radioIrq = false;
-        DataPacket data;
-        PacketResult result = receivePacket(data);
-
-        // La radio vuelve a escuchar ANTES del POST: si llega otro paquete mientras tanto,
-        // el SX1276 lo recibe solo y se procesa al terminar.
+        receivePacket();
+        // Vuelve a escuchar antes de cualquier POST: si llega otro paquete mientras tanto,
+        // el SX1276 lo recibe solo y se procesa en la siguiente vuelta.
         radio.startReceive();
-
-        if (result == PACKET_NEW) {
-            forwardToBackend(data);
-        } else if (result == PACKET_DUPLICATE) {
-            Serial.println("  POST      : omitido (DUPLICADO)");
-        }
     }
+
+    // Un POST como maximo por vuelta, para atender la radio entre envios.
+    processQueue();
 
     if (millis() - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatMs = millis();
-        Serial.printf("[base] escuchando... aceptados %lu | duplicados %lu | descartados %lu | "
-                      "POST ok %lu | POST fallidos %lu | WiFi %s\n",
+        Serial.printf("[base] aceptados %lu | duplicados %lu | descartados %lu | cola %u/%u | "
+                      "POST ok %lu | reintentos %lu | rechazados %lu | WiFi %s\n",
                       (unsigned long)packetsAccepted, (unsigned long)packetsDuplicated,
-                      (unsigned long)packetsRejected, (unsigned long)postsOk, (unsigned long)postsFailed,
+                      (unsigned long)packetsRejected, queueCount, QUEUE_CAPACITY, (unsigned long)postsOk,
+                      (unsigned long)postsRetried, (unsigned long)postsDiscarded,
                       WiFi.status() == WL_CONNECTED ? "OK" : "sin conexion");
     }
 }

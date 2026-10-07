@@ -24,26 +24,43 @@ static const uint8_t LORA_SPREADING_FACTOR = 9;
 static const uint8_t LORA_CODING_RATE = 5;          // 4/5
 static const uint8_t LORA_SYNC_WORD = 0x12;         // privado; LoRaWAN usa 0x34
 static const uint16_t LORA_PREAMBLE_LENGTH = 8;
-// 10 dBm para pruebas de escritorio (placas a ~1 m; a maxima potencia el receptor se satura).
-// En campo subir a 17-20 dBm.
-static const int8_t LORA_TX_POWER_DBM = 10;
+// 17 dBm para campo. Para pruebas de escritorio (placas a ~1 m) bajar a 10 dBm:
+// a mayor potencia el receptor se satura y el SNR medido deja de ser confiable.
+static const int8_t LORA_TX_POWER_DBM = 17;
 
 // --- Protocolo ---
-static const uint8_t PROTOCOL_VERSION = 1;
+// v2 agrega el nivel de bateria (RF9). La estacion base acepta v1 y v2 y responde
+// el ACK con la misma version recibida, asi un collar sin actualizar sigue funcionando.
+static const uint8_t PROTOCOL_VERSION = 2;
+static const uint8_t PROTOCOL_VERSION_V1 = 1;
 static const uint8_t MSG_TYPE_DATA = 0x01;
 static const uint8_t MSG_TYPE_ACK = 0x02;
 static const size_t COLLAR_ID_LEN = 16;
+static const uint8_t BATTERY_UNKNOWN = 255;  // sin bateria conectada (p. ej. solo USB)
 
 // Ambos extremos son ESP32 (little-endian), por eso se transmite el struct empaquetado tal cual.
 struct __attribute__((packed)) DataPacket {
-    uint8_t version;
+    uint8_t version;               // PROTOCOL_VERSION
     uint8_t type;                  // MSG_TYPE_DATA
-    uint16_t seq;                  // igual en los reintentos del mismo paquete
+    uint16_t seq;                  // igual en los reintentos del mismo registro
     char collarId[COLLAR_ID_LEN];  // rellenado con ceros, sin terminador si ocupa los 16
     int32_t latE6;                 // grados * 1e6
     int32_t lonE6;                 // grados * 1e6
-    uint32_t timestamp;            // epoch UTC en segundos (fecha/hora del GPS)
+    uint32_t timestamp;            // epoch UTC en segundos (hora de la lectura GPS, no del envio)
     uint8_t satellites;            // satelites en uso
+    uint8_t batteryPercent;        // 0-100, o BATTERY_UNKNOWN
+};
+
+// Formato v1 (sin bateria), solo para que la estacion base lo siga aceptando.
+struct __attribute__((packed)) DataPacketV1 {
+    uint8_t version;
+    uint8_t type;
+    uint16_t seq;
+    char collarId[COLLAR_ID_LEN];
+    int32_t latE6;
+    int32_t lonE6;
+    uint32_t timestamp;
+    uint8_t satellites;
 };
 
 struct __attribute__((packed)) AckPacket {
@@ -53,7 +70,8 @@ struct __attribute__((packed)) AckPacket {
     char collarId[COLLAR_ID_LEN];  // collar al que va dirigido
 };
 
-static_assert(sizeof(DataPacket) == 33, "DataPacket debe medir 33 bytes");
+static_assert(sizeof(DataPacket) == 34, "DataPacket (v2) debe medir 34 bytes");
+static_assert(sizeof(DataPacketV1) == 33, "DataPacketV1 debe medir 33 bytes");
 static_assert(sizeof(AckPacket) == 20, "AckPacket debe medir 20 bytes");
 
 inline int16_t beginLoraRadio(SX1276 &radio) {
