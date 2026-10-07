@@ -47,7 +47,7 @@ eventsRouter.get("/", async (req: Request, res: Response) => {
 
     if (animalId !== undefined) {
         values.push(animalId);
-        conditions.push(`ge.animal_id = $${values.length}`);
+        conditions.push(`l.animal_id = $${values.length}`);
     }
     if (rawFrom !== undefined) {
         values.push(rawFrom);
@@ -62,10 +62,12 @@ eventsRouter.get("/", async (req: Request, res: Response) => {
 
     try {
         const result = await pool.query(
-            `SELECT ge.id, ge.animal_id, a.tag_number, a.name AS animal_name,
-                    ge.location_id, ge.event_type, ge.occurred_at, ge.created_at
+            // El animal sale de la lectura que confirmo el evento (geofence_events no lo repite).
+            `SELECT ge.id, l.animal_id, a.tag_number, a.name AS animal_name,
+                    ge.location_id, ge.geofence_id, ge.event_type, ge.occurred_at, ge.created_at
              FROM geofence_events ge
-             JOIN animals a ON a.id = ge.animal_id
+             JOIN locations l ON l.id = ge.location_id
+             JOIN animals a ON a.id = l.animal_id
              ${whereClause}
              ORDER BY ge.occurred_at DESC, ge.id DESC`,
             values

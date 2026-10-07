@@ -3,6 +3,7 @@ import { pool } from "./config/database";
 import { animalsRouter } from "./routes/animals.routes";
 import { locationsRouter } from "./routes/locations.routes";
 import { eventsRouter } from "./routes/events.routes";
+import { geofenceRouter } from "./routes/geofence.routes";
 
 export const app: Express = express();
 
@@ -11,6 +12,7 @@ app.use(express.json());
 app.use("/animals", animalsRouter);
 app.use("/locations", locationsRouter);
 app.use("/events", eventsRouter);
+app.use("/geofence", geofenceRouter);
 
 app.get("/health", async (_req: Request, res: Response) => {
     try {

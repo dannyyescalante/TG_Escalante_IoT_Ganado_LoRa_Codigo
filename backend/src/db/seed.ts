@@ -5,25 +5,30 @@ dotenv.config();
 
 /**
  * ============================================================================
- * PLACEHOLDER TEMPORAL — NO SON COORDENADAS REALES
+ * GEOCERCA TEMPORAL DE PRUEBA — NO ES LA GEOCERCA REAL DE LA FINCA
  * ============================================================================
- * Este polígono es un rectángulo sintético de ~2 hectáreas (200m x 100m)
- * ubicado como referencia general cerca del municipio García de Hevia,
- * estado Táchira, Venezuela (~8.22°N, -72.27°O).
+ * Cuadrado de 40 m x 40 m en San Cristobal, Tachira, usado para la prueba de
+ * campo caminando con el collar en "Casa de Mafer" (centro 7.761292, -72.223944).
+ * Se amplio a 40 m por lado porque el ruido del GPS NEO-6M (~7 m medido en campo)
+ * generaria salidas falsas en un area mas pequena.
  *
- * DEBE reemplazarse por las coordenadas reales del corral piloto una vez
- * se capturen en campo (ej. con GPS/RTK sobre el terreno real). No usar
- * este polígono para ninguna decisión operativa o de validación real.
+ * Otra geocerca de prueba usada: cuadrilatero de ~1720 m2 en "Casa Danny"
+ * (centro ~7.762124, -72.217737):
+ *   POLYGON((-72.217501 7.762129, -72.217624 7.761883, -72.217980 7.762036,
+ *            -72.217808 7.762436, -72.217501 7.762129))
+ *
+ * DEBE reemplazarse por el poligono real del corral piloto en Garcia de Hevia
+ * cuando se capturen sus coordenadas en campo.
  * ============================================================================
  */
-const PLACEHOLDER_GEOFENCE_NAME = "Potrero piloto (PLACEHOLDER - reemplazar con coordenadas reales)";
-const PLACEHOLDER_GEOFENCE_WKT =
+const GEOFENCE_NAME = "Prueba de campo - Casa de Mafer (TEMPORAL)";
+const GEOFENCE_WKT =
     "POLYGON((" +
-    "-72.270908 8.219551, " +
-    "-72.269092 8.219551, " +
-    "-72.269092 8.220449, " +
-    "-72.270908 8.220449, " +
-    "-72.270908 8.219551" +
+    "-72.224126 7.761111, " +
+    "-72.224126 7.761473, " +
+    "-72.223763 7.761473, " +
+    "-72.223763 7.761111, " +
+    "-72.224126 7.761111" +
     "))";
 
 async function seedGeofence(): Promise<void> {
@@ -37,40 +42,54 @@ async function seedGeofence(): Promise<void> {
 
     await client.connect();
 
-    const { rows: existing } = await client.query(
-        "SELECT id FROM geofence WHERE name = $1",
-        [PLACEHOLDER_GEOFENCE_NAME]
+    // Una sola geocerca activa (indice unico parcial). La anterior no se sobrescribe: queda
+    // inactiva como historial, porque locations y geofence_events apuntan al poligono exacto usado.
+    const { rows: active } = await client.query(
+        "SELECT id, name, ST_Equals(geom, ST_GeomFromText($1, 4326)) AS same_geom FROM geofence WHERE is_active",
+        [GEOFENCE_WKT]
     );
 
-    if (existing.length > 0) {
-        console.log("El polígono placeholder ya existe (id " + existing[0].id + "), no se vuelve a insertar.");
+    let geofenceId: number;
+    if (active.length > 0 && active[0].name === GEOFENCE_NAME && active[0].same_geom) {
+        geofenceId = active[0].id;
+        console.log("La geocerca activa (id " + geofenceId + ") ya es esta; no hay cambios.");
     } else {
-        const insertResult = await client.query(
-            "INSERT INTO geofence (name, geom) VALUES ($1, ST_GeomFromText($2, 4326)) RETURNING id",
-            [PLACEHOLDER_GEOFENCE_NAME, PLACEHOLDER_GEOFENCE_WKT]
-        );
-        console.log("Polígono placeholder insertado con id " + insertResult.rows[0].id);
+        await client.query("BEGIN");
+        try {
+            await client.query("UPDATE geofence SET is_active = false WHERE is_active");
+            const insertResult = await client.query(
+                "INSERT INTO geofence (name, geom) VALUES ($1, ST_GeomFromText($2, 4326)) RETURNING id",
+                [GEOFENCE_NAME, GEOFENCE_WKT]
+            );
+            await client.query("COMMIT");
+            geofenceId = insertResult.rows[0].id;
+        } catch (err) {
+            await client.query("ROLLBACK");
+            throw err;
+        }
+        const previous = active.length > 0 ? " (la anterior, id " + active[0].id + ", queda inactiva)" : "";
+        console.log("Geocerca activa: id " + geofenceId + " - " + GEOFENCE_NAME + previous);
     }
 
     const verify = await client.query(
         `SELECT
             id,
             name,
+            ST_IsValid(geom) AS valid,
             ST_AsText(geom) AS wkt,
-            ST_Area(geom::geography) AS area_m2,
-            ST_Area(geom::geography) / 10000 AS area_hectareas
+            ST_Area(geom::geography) AS area_m2
          FROM geofence
-         WHERE name = $1`,
-        [PLACEHOLDER_GEOFENCE_NAME]
+         WHERE id = $1`,
+        [geofenceId]
     );
 
-    console.log("\n--- Verificación PostGIS ---");
+    console.log("\n--- Verificacion PostGIS ---");
     console.table(
         verify.rows.map((r) => ({
             id: r.id,
             name: r.name,
-            area_m2: Number(r.area_m2).toFixed(2),
-            area_hectareas: Number(r.area_hectareas).toFixed(4),
+            valida: r.valid,
+            area_m2: Number(r.area_m2).toFixed(1),
         }))
     );
     console.log("WKT:", verify.rows[0].wkt);
@@ -79,6 +98,6 @@ async function seedGeofence(): Promise<void> {
 }
 
 seedGeofence().catch((err) => {
-    console.error("Error al sembrar la geocerca placeholder:", err);
+    console.error("Error al sembrar la geocerca:", err);
     process.exit(1);
 });

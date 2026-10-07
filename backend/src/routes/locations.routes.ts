@@ -21,9 +21,22 @@ function parsePositiveInt(raw: string): number | null {
     return Number(raw);
 }
 
+// Campos opcionales: undefined o null = no enviado; si viene, debe estar en rango.
+function isOptionalNumberInRange(value: unknown, min: number, max: number, integer: boolean): boolean {
+    if (value === undefined || value === null) return true;
+    if (typeof value !== "number" || !Number.isFinite(value)) return false;
+    if (integer && !Number.isInteger(value)) return false;
+    return value >= min && value <= max;
+}
+
+const LOCATION_COLUMNS = `id, animal_id, geofence_id, ST_Y(geom) AS lat, ST_X(geom) AS lon,
+    recorded_at, received_at, inside_geofence, battery_percent, satellites, packet_seq,
+    rssi, snr, created_at`;
+
 // POST /locations
 locationsRouter.post("/", async (req: Request, res: Response) => {
-    const { collar_device_id, lat, lon, timestamp } = req.body ?? {};
+    const { collar_device_id, lat, lon, timestamp, battery_percent, satellites, packet_seq, rssi, snr } =
+        req.body ?? {};
 
     const errors: string[] = [];
     if (!isNonEmptyString(collar_device_id)) {
@@ -33,6 +46,21 @@ locationsRouter.post("/", async (req: Request, res: Response) => {
     if (!isValidLongitude(lon)) errors.push("lon es requerido y debe ser un numero entre -180 y 180.");
     if (!isNonEmptyString(timestamp) || Number.isNaN(Date.parse(timestamp))) {
         errors.push("timestamp es requerido y debe ser una fecha valida (ISO 8601).");
+    }
+    if (!isOptionalNumberInRange(battery_percent, 0, 100, true)) {
+        errors.push("battery_percent es opcional; si se envia debe ser un entero entre 0 y 100 o null.");
+    }
+    if (!isOptionalNumberInRange(satellites, 0, 255, true)) {
+        errors.push("satellites es opcional; si se envia debe ser un entero entre 0 y 255 o null.");
+    }
+    if (!isOptionalNumberInRange(packet_seq, 0, 65535, true)) {
+        errors.push("packet_seq es opcional; si se envia debe ser un entero entre 0 y 65535 o null.");
+    }
+    if (!isOptionalNumberInRange(rssi, -200, 0, false)) {
+        errors.push("rssi es opcional; si se envia debe ser un numero entre -200 y 0 (dBm) o null.");
+    }
+    if (!isOptionalNumberInRange(snr, -50, 50, false)) {
+        errors.push("snr es opcional; si se envia debe ser un numero entre -50 y 50 (dB) o null.");
     }
 
     if (errors.length > 0) {
@@ -54,31 +82,49 @@ locationsRouter.post("/", async (req: Request, res: Response) => {
 
         const animalId = animalResult.rows[0].id;
 
-        // ST_Contains y el INSERT van en una sola sentencia (INSERT ... SELECT ... FROM geofence)
-        // para que el resultado de inside_geofence corresponda exactamente a la fila insertada,
-        // sin una lectura previa separada de la geocerca.
+        const geofenceResult = await pool.query("SELECT id FROM geofence WHERE is_active");
+        if (geofenceResult.rowCount === 0) {
+            return res.status(500).json({
+                status: "error",
+                message: "No hay ninguna geocerca activa en el sistema.",
+            });
+        }
+        const geofenceId = geofenceResult.rows[0].id;
+
+        // ST_Contains y el INSERT van en una sola sentencia para que inside_geofence corresponda
+        // exactamente al poligono de geofence_id. ON CONFLICT hace la ingesta idempotente: una
+        // lectura repetida (mismo animal y misma hora GPS) no se inserta.
         const insertResult = await pool.query(
             `WITH inserted AS (
-                INSERT INTO locations (animal_id, geom, recorded_at, inside_geofence)
-                SELECT $1,
-                       ST_SetSRID(ST_MakePoint($2, $3), 4326),
-                       $4,
-                       ST_Contains(geofence.geom, ST_SetSRID(ST_MakePoint($2, $3), 4326))
-                FROM geofence
-                ORDER BY id
-                LIMIT 1
+                INSERT INTO locations (animal_id, geofence_id, geom, recorded_at, inside_geofence,
+                                       battery_percent, satellites, packet_seq, rssi, snr)
+                SELECT $1, g.id,
+                       ST_SetSRID(ST_MakePoint($3, $4), 4326),
+                       $5,
+                       ST_Contains(g.geom, ST_SetSRID(ST_MakePoint($3, $4), 4326)),
+                       $6, $7, $8, $9, $10
+                FROM geofence g
+                WHERE g.id = $2
+                ON CONFLICT (animal_id, recorded_at) DO NOTHING
                 RETURNING *
              )
-             SELECT id, animal_id, ST_Y(geom) AS lat, ST_X(geom) AS lon,
-                    recorded_at, received_at, inside_geofence, created_at
-             FROM inserted`,
-            [animalId, lon, lat, timestamp]
+             SELECT ${LOCATION_COLUMNS} FROM inserted`,
+            [animalId, geofenceId, lon, lat, timestamp, battery_percent ?? null, satellites ?? null,
+             packet_seq ?? null, rssi ?? null, snr ?? null]
         );
 
         if (insertResult.rowCount === 0) {
-            return res.status(500).json({
-                status: "error",
-                message: "No hay ninguna geocerca configurada en el sistema.",
+            // Ya registrada (p. ej. la estacion base reintento tras un timeout): no se reevalua
+            // la geocerca ni se dispara otra alerta. 200 = exito para quien reintenta.
+            const existing = await pool.query(
+                `SELECT ${LOCATION_COLUMNS} FROM locations WHERE animal_id = $1 AND recorded_at = $2`,
+                [animalId, timestamp]
+            );
+            return res.status(200).json({
+                ...existing.rows[0],
+                status: "duplicate",
+                message: "Lectura ya registrada.",
+                geofence_event: null,
             });
         }
 
@@ -86,6 +132,7 @@ locationsRouter.post("/", async (req: Request, res: Response) => {
 
         const geofenceEvent = await evaluateGeofenceTransition({
             animalId: location.animal_id,
+            geofenceId: location.geofence_id,
             locationId: location.id,
             insideGeofence: location.inside_geofence,
             recordedAt: location.recorded_at,
@@ -120,8 +167,7 @@ locationsRouter.get("/:animalId", async (req: Request, res: Response) => {
         }
 
         const locationsResult = await pool.query(
-            `SELECT id, animal_id, ST_Y(geom) AS lat, ST_X(geom) AS lon,
-                    recorded_at, received_at, inside_geofence, created_at
+            `SELECT ${LOCATION_COLUMNS}
              FROM locations
              WHERE animal_id = $1
              ORDER BY recorded_at DESC, id DESC
