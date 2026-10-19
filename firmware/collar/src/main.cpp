@@ -71,9 +71,24 @@ struct RtcState {
     uint16_t count;
     BufferedReading records[BUFFER_CAPACITY];
 };
+static_assert(sizeof(RtcState) == 3864, "RtcState debe medir 3864 bytes (no cambiar su layout)");
 
 static const uint32_t RTC_STATE_MAGIC = 0xC0114A02;
 RTC_NOINIT_ATTR RtcState rtcState;
+
+// RNF8: contadores de transmision acumulados desde el ultimo encendido en frio. Van en una
+// variable RTC aparte, con su propio valor magico, para no tocar el layout de rtcState.
+struct TxStats {
+    uint32_t magic;
+    uint32_t totalAttempts;  // cada llamada a radio.transmit
+    uint32_t ackOk;
+    uint32_t ackTimeout;
+    uint32_t retries;        // intentos con numero > 1
+    uint32_t txErrors;       // radio.transmit devolvio error
+};
+
+static const uint32_t TX_STATS_MAGIC = 0x7A5C0001;
+RTC_NOINIT_ATTR TxStats txStats;
 
 TinyGPSPlus gps;
 HardwareSerial GPSSerial(1);
@@ -253,7 +268,9 @@ uint32_t toEpochUtc(int year, int month, int day, int hour, int minute, int seco
 // Lee el GPS hasta FIX_WAIT_MS; si hay fix, guarda la lectura al final del buffer (RF3).
 void captureReading(uint8_t batteryPercent) {
     uint32_t start = millis();
-    while (millis() - start < FIX_WAIT_MS && !(hasValidFix() && isTimeKnown())) {
+    // Tambien espera los satelites (trama GGA): sin esto el bucle podia salir antes de la GGA y
+    // guardar satellites = 0. Si la GGA no llega en FIX_WAIT_MS, la lectura se guarda igual con 0.
+    while (millis() - start < FIX_WAIT_MS && !(hasValidFix() && isTimeKnown() && gps.satellites.isValid())) {
         readGps();
     }
 
@@ -267,8 +284,9 @@ void captureReading(uint8_t batteryPercent) {
                                        gps.time.hour(), gps.time.minute(), gps.time.second());
         uint32_t satellites = gps.satellites.isValid() ? gps.satellites.value() : 0;
         reading.satellites = (uint8_t)min<uint32_t>(satellites, 255);
-        Serial.printf("GPS: fix en %lu ms | lat=%.6f lon=%.6f | sats=%u\n", (unsigned long)(millis() - start),
-                      reading.latE6 / 1e6, reading.lonE6 / 1e6, reading.satellites);
+        Serial.printf("GPS: fix en %lu ms (t=%lu ms desde despertar) | lat=%.6f lon=%.6f | sats=%u\n",
+                      (unsigned long)(millis() - start), (unsigned long)millis(), reading.latE6 / 1e6,
+                      reading.lonE6 / 1e6, reading.satellites);
     } else if (DEBUG_SEND_WITHOUT_FIX) {
         reading.latE6 = (int32_t)lround(DEBUG_TEST_LAT * 1e6);
         reading.lonE6 = (int32_t)lround(DEBUG_TEST_LON * 1e6);
@@ -297,11 +315,16 @@ bool sendWithAck(const DataPacket &packet) {
     const int totalAttempts = 1 + MAX_RETRIES;
 
     for (int attempt = 1; attempt <= totalAttempts; attempt++) {
+        txStats.totalAttempts++;
+        if (attempt > 1) txStats.retries++;
+
         int16_t state = radio.transmit((uint8_t *)&packet, sizeof(packet));
         // DIO0 tambien se activa con TxDone: se descarta antes de escuchar el ACK.
         radioIrq = false;
         if (state != RADIOLIB_ERR_NONE) {
-            Serial.printf("  intento %d/%d: error de TX (codigo %d)\n", attempt, totalAttempts, state);
+            txStats.txErrors++;
+            Serial.printf("[TX] seq=%u intento=%d resultado=ERROR_TX espera_ms=0 codigo=%d\n", packet.seq, attempt,
+                          state);
             continue;
         }
 
@@ -315,17 +338,19 @@ bool sendWithAck(const DataPacket &packet) {
             size_t length = radio.getPacketLength();
             int16_t rxState = radio.readData(buffer, length);
             if (rxState == RADIOLIB_ERR_NONE && isOurAck(buffer, length, packet)) {
-                Serial.printf("  intento %d/%d: ACK recibido en %lu ms (RSSI %.1f dBm, SNR %.1f dB)\n",
-                              attempt, totalAttempts, (unsigned long)(millis() - waitStart),
-                              radio.getRSSI(), radio.getSNR());
+                txStats.ackOk++;
+                // espera_ms: desde el fin de la transmision hasta el ACK (no incluye el tiempo en el aire).
+                Serial.printf("[TX] seq=%u intento=%d resultado=ACK espera_ms=%lu rssi=%.1f snr=%.1f\n", packet.seq,
+                              attempt, (unsigned long)(millis() - waitStart), radio.getRSSI(), radio.getSNR());
                 radio.standby();
                 return true;
             }
             // No era nuestro ACK o llego corrupto: seguir escuchando hasta el timeout.
             radio.startReceive();
         }
-        Serial.printf("  intento %d/%d: sin ACK en %lu ms\n", attempt, totalAttempts,
-                      (unsigned long)ACK_TIMEOUT_MS);
+        txStats.ackTimeout++;
+        Serial.printf("[TX] seq=%u intento=%d resultado=TIMEOUT espera_ms=%lu\n", packet.seq, attempt,
+                      (unsigned long)(millis() - waitStart));
     }
 
     radio.standby();
@@ -378,6 +403,11 @@ void goToSleep() {
     if (radioReady) radio.sleep();
     saveRtcState();
 
+    Serial.printf("[STATS] intentos_totales=%lu ack_ok=%lu ack_timeout=%lu reintentos=%lu error_tx=%lu\n",
+                  (unsigned long)txStats.totalAttempts, (unsigned long)txStats.ackOk,
+                  (unsigned long)txStats.ackTimeout, (unsigned long)txStats.retries,
+                  (unsigned long)txStats.txErrors);
+
     uint32_t awakeMs = millis();
     uint32_t sleepMs = awakeMs < TX_INTERVAL_MS ? TX_INTERVAL_MS - awakeMs : 1000;
     Serial.printf("Durmiendo %lu ms (despierto %lu ms) | buffer=%u/%u\n", (unsigned long)sleepMs,
@@ -394,13 +424,20 @@ void setup() {
 
     bool restored = restoreRtcState();
     rtcState.wakeCount++;
+
+    // Tras una perdida de energia la memoria RTC trae basura: el magico no coincide y se reinicia.
+    bool txStatsRestored = txStats.magic == TX_STATS_MAGIC;
+    if (!txStatsRestored) {
+        memset(&txStats, 0, sizeof(txStats));
+        txStats.magic = TX_STATS_MAGIC;
+    }
     bool timerWake = esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER;
 
     Serial.println();
-    Serial.printf("=== %s | despertar #%lu (%s) | buffer=%u/%u%s | descartados por buffer lleno=%lu ===\n",
+    Serial.printf("=== %s | despertar #%lu (%s) | buffer=%u/%u%s | descartados por buffer lleno=%lu%s ===\n",
                   COLLAR_ID, (unsigned long)rtcState.wakeCount, timerWake ? "temporizador" : "encendido",
                   rtcState.count, BUFFER_CAPACITY, restored ? "" : " (estado nuevo)",
-                  (unsigned long)rtcState.droppedTotal);
+                  (unsigned long)rtcState.droppedTotal, txStatsRestored ? "" : " | contadores TX nuevos");
 
     if (!powerOnPeripherals()) {
         Serial.println("ATENCION: no se detecto PMU (AXP2101/AXP192); GPS y LoRa podrian no estar alimentados");

@@ -286,6 +286,9 @@ PacketResult receivePacket() {
     Serial.printf("  ACK       : %s\n", ackSent ? "enviado" : "FALLO");
     Serial.printf("  cola      : %s (pendientes %u/%u)\n", duplicate ? "omitido (DUPLICADO)" : "encolado",
                   queueCount, QUEUE_CAPACITY);
+    // RNF8: misma informacion en una sola linea facil de parsear.
+    Serial.printf("[RX] collar=%s seq=%u rssi=%.1f snr=%.2f duplicado=%s\n", collarId, data.seq, rssi, snr,
+                  duplicate ? "si" : "no");
 
     return duplicate ? PACKET_DUPLICATE : PACKET_NEW;
 }
