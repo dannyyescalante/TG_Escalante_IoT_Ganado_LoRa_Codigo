@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <time.h>
+#include <esp_system.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <RadioLib.h>
@@ -17,9 +18,22 @@ static const int32_t HTTP_CONNECT_TIMEOUT_MS = 2000;
 static const uint16_t HTTP_RESPONSE_TIMEOUT_MS = 3000;
 static const size_t RESPONSE_LOG_MAX_CHARS = 200;
 
-// Cola de reenvio al backend: si el POST falla por red/backend, se reintenta en orden.
+// Cola de reenvio al backend (RF12): si el POST falla por red/backend, se reintenta en orden.
+// Vive en RAM: sin WiFi guarda hasta 500 lecturas (~8 h con un collar a 1 lectura/min).
+// Si se llena, se descarta la mas antigua (ver enqueue). Un reinicio la borra.
 static const uint16_t QUEUE_CAPACITY = 500;
-static const uint32_t POST_RETRY_INTERVAL_MS = 10000;
+// Espera creciente entre reintentos de POST (tope 30 s): un backend apagado no se consulta en rafaga.
+static const uint32_t POST_RETRY_MS[] = {10000, 20000, 30000};
+static const uint8_t POST_RETRY_STEPS = sizeof(POST_RETRY_MS) / sizeof(POST_RETRY_MS[0]);
+
+// Reconexion WiFi propia (RF12): espera creciente entre intentos, sin bloquear la radio.
+static const uint32_t WIFI_BACKOFF_MS[] = {2000, 5000, 10000, 20000, 30000};
+static const uint8_t WIFI_BACKOFF_STEPS = sizeof(WIFI_BACKOFF_MS) / sizeof(WIFI_BACKOFF_MS[0]);
+// POST seguidos sin respuesta de red con el WiFi "conectado" = asociacion vieja: se fuerza reconexion.
+static const uint8_t POST_NET_FAIL_LIMIT = 3;
+// Ultimo recurso: reiniciar si el WiFi no vuelve en este tiempo Y la red esta visible (pila WiFi trabada).
+static const uint32_t WIFI_RESTART_AFTER_MS = 5UL * 60UL * 1000UL;
+static const uint32_t RESTART_TRACE_MAGIC = 0x57494649;  // "WIFI"
 
 // Duplicados: ultimo registro aceptado de cada collar (reintentos por ACK perdido).
 static const uint8_t MAX_TRACKED_COLLARS = 16;
@@ -29,9 +43,31 @@ SX1276 radio = new Module(LORA_CS_PIN, LORA_DIO0_PIN, LORA_RST_PIN, LORA_DIO1_PI
 
 volatile bool radioIrq = false;
 bool radioReady = false;
-bool wifiWasConnected = false;
 uint32_t lastHeartbeatMs = 0;
 uint32_t nextPostAttemptMs = 0;
+uint16_t postFailStreak = 0;   // POST fallidos seguidos (cualquier motivo): define la espera del reintento
+uint8_t postNetFailures = 0;   // POST seguidos sin respuesta de red (code <= 0)
+
+// Estado del WiFi segun este firmware. WiFi.status() solo no basta: en campo siguio en
+// WL_CONNECTED mientras el punto de acceso ya no tenia a la base asociada.
+enum WifiState { WIFI_UP, WIFI_DOWN };
+WifiState wifiState = WIFI_DOWN;
+bool wifiEverConnected = false;
+uint32_t wifiDownSinceMs = 0;
+uint32_t nextWifiAttemptMs = 0;
+uint16_t wifiAttempts = 0;
+bool restartScanStarted = false;
+volatile bool wifiGotIp = false;  // lo escribe el manejador de eventos WiFi (otra tarea)
+
+// Motivo del ultimo reinicio por WiFi: RTC_NOINIT sobrevive a ESP.restart(), pero tras un
+// encendido en frio trae basura, por eso se valida con magic al arrancar.
+struct RestartTrace {
+    uint32_t magic;
+    uint32_t restarts;      // reinicios por WiFi desde el ultimo encendido en frio
+    uint32_t lastLost;      // lecturas en cola que se perdieron en el ultimo reinicio
+    uint32_t pending;       // 1 = el proximo arranque viene de un reinicio por WiFi
+};
+RTC_NOINIT_ATTR RestartTrace restartTrace;
 
 uint32_t packetsAccepted = 0;
 uint32_t packetsRejected = 0;
@@ -216,6 +252,31 @@ void dequeueOldest() {
     queueCount--;
 }
 
+static uint8_t stepIndex(uint16_t n, uint8_t steps) {
+    return n < steps ? (uint8_t)n : (uint8_t)(steps - 1);
+}
+
+void onWifiEvent(WiFiEvent_t event) {
+    if (event == ARDUINO_EVENT_WIFI_STA_GOT_IP) {
+        wifiGotIp = true;
+    } else if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED || event == ARDUINO_EVENT_WIFI_STA_LOST_IP) {
+        wifiGotIp = false;
+    }
+}
+
+// Pasa a "sin WiFi" y programa el primer intento de reconexion. Reinicia el conteo de fallos de POST
+// para que la proxima reconexion forzada necesite otros POST_NET_FAIL_LIMIT fallos (espaciados por su espera).
+void markWifiDown(const char *reason) {
+    postNetFailures = 0;
+    if (wifiState == WIFI_DOWN) return;
+    wifiState = WIFI_DOWN;
+    wifiDownSinceMs = millis();
+    wifiAttempts = 0;
+    nextWifiAttemptMs = millis();
+    restartScanStarted = false;
+    Serial.printf("[WIFI] desconexion detectada (%s) | cola %u/%u\n", reason, queueCount, QUEUE_CAPACITY);
+}
+
 PacketResult receivePacket() {
     uint8_t buffer[256];
     size_t length = radio.getPacketLength();
@@ -332,8 +393,13 @@ PostResult postReading(const QueuedReading &item) {
         Serial.printf("POST [%s seq=%u]: ERROR %s en %lu ms\n", item.collarId, item.seq,
                       HTTPClient::errorToString(code).c_str(), (unsigned long)elapsedMs);
         http.end();
+        // Sin respuesta de red: varias seguidas con el WiFi "conectado" = asociacion vieja.
+        if (++postNetFailures >= POST_NET_FAIL_LIMIT) {
+            markWifiDown("POST seguidos sin respuesta de red; se fuerza la reconexion");
+        }
         return POST_RETRY;
     }
+    postNetFailures = 0;  // hubo respuesta HTTP: la red funciona (aunque el backend responda error)
 
     String response = http.getString();
     http.end();
@@ -349,18 +415,21 @@ PostResult postReading(const QueuedReading &item) {
 }
 
 void processQueue() {
-    if (queueCount == 0 || WiFi.status() != WL_CONNECTED) return;
+    if (queueCount == 0 || wifiState != WIFI_UP) return;
     if ((int32_t)(millis() - nextPostAttemptMs) < 0) return;
 
     PostResult result = postReading(queue[queueHead]);
     if (result == POST_RETRY) {
         postsRetried++;
-        nextPostAttemptMs = millis() + POST_RETRY_INTERVAL_MS;
+        uint32_t waitMs = POST_RETRY_MS[stepIndex(postFailStreak, POST_RETRY_STEPS)];
+        postFailStreak++;
+        nextPostAttemptMs = millis() + waitMs;
         Serial.printf("  -> queda en la cola, se reintenta en %lu s (pendientes %u)\n",
-                      (unsigned long)(POST_RETRY_INTERVAL_MS / 1000), queueCount);
+                      (unsigned long)(waitMs / 1000), queueCount);
         return;
     }
 
+    postFailStreak = 0;
     if (result == POST_OK) {
         postsOk++;
     } else {
@@ -370,17 +439,114 @@ void processQueue() {
     dequeueOldest();
 }
 
-void logWifiChanges() {
-    bool connected = WiFi.status() == WL_CONNECTED;
-    if (connected == wifiWasConnected) return;
-    wifiWasConnected = connected;
-
-    if (connected) {
-        Serial.printf("[wifi] conectado a \"%s\" | IP %s | backend %s\n", WIFI_SSID,
-                      WiFi.localIP().toString().c_str(), BACKEND_URL);
-    } else {
-        Serial.println("[wifi] desconectado (reconexion automatica activa)");
+// Ultimo recurso. Se imprime cada lectura que se va a perder, para que quede rastro en el log.
+void restartForWifi() {
+    Serial.printf("[WIFI] reinicio: la red esta visible pero no conecta hace %lu min | se pierden %u lecturas de la cola\n",
+                  (unsigned long)((millis() - wifiDownSinceMs) / 60000), queueCount);
+    for (uint16_t i = 0; i < queueCount; i++) {
+        const QueuedReading &r = queue[(queueHead + i) % QUEUE_CAPACITY];
+        Serial.printf("[WIFI] perdida por reinicio: collar=%s seq=%u ts=%lu\n", r.collarId, r.seq,
+                      (unsigned long)r.timestamp);
     }
+    restartTrace.restarts++;
+    restartTrace.lastLost = queueCount;
+    restartTrace.pending = 1;
+    Serial.flush();
+    ESP.restart();
+}
+
+// Tras WIFI_RESTART_AFTER_MS sin WiFi se busca la red (escaneo asincrono, no bloquea la radio).
+// No visible = router/hotspot apagado: no se reinicia, para conservar la cola, y se vuelve a evaluar
+// en otro periodo. Visible pero sin conexion = pila WiFi trabada: se reinicia.
+// Devuelve true mientras el escaneo esta en curso (no se intenta conectar para no cortarlo).
+bool considerRestart() {
+    if (!restartScanStarted) {
+        WiFi.disconnect();
+        WiFi.scanNetworks(true);
+        restartScanStarted = true;
+        Serial.printf("[WIFI] %lu min sin WiFi: se busca la red para decidir si reiniciar | cola %u/%u\n",
+                      (unsigned long)((millis() - wifiDownSinceMs) / 60000), queueCount, QUEUE_CAPACITY);
+        return true;
+    }
+
+    int16_t found = WiFi.scanComplete();
+    if (found == WIFI_SCAN_RUNNING) return true;
+
+    bool visible = false;
+    for (int16_t i = 0; i < found; i++) {
+        if (WiFi.SSID(i) == WIFI_SSID) {
+            visible = true;
+            break;
+        }
+    }
+    WiFi.scanDelete();
+    restartScanStarted = false;
+
+    if (!visible) {
+        Serial.printf("[WIFI] la red no esta visible tras %lu min sin WiFi: no se reinicia (se conserva la cola %u/%u)\n",
+                      (unsigned long)((millis() - wifiDownSinceMs) / 60000), queueCount, QUEUE_CAPACITY);
+        wifiDownSinceMs = millis();
+        return false;
+    }
+    restartForWifi();
+    return true;
+}
+
+// Se llama en cada vuelta de loop(); nada aqui espera a que el WiFi conecte.
+void maintainWifi() {
+    uint32_t now = millis();
+
+    if (wifiState == WIFI_UP) {
+        if (WiFi.status() != WL_CONNECTED || !wifiGotIp) {
+            markWifiDown("el ESP32 reporta WiFi caido");
+        }
+        return;
+    }
+
+    // wifiGotIp lo pone en false cada intento: se exige una IP obtenida despues del ultimo intento,
+    // no un WL_CONNECTED que quedo de antes del disconnect().
+    if (wifiAttempts > 0 && wifiGotIp && WiFi.status() == WL_CONNECTED) {
+        wifiState = WIFI_UP;
+        Serial.printf("[WIFI] %s tras %u intento(s) en %lu s | IP %s | RSSI %d dBm | cola %u/%u\n",
+                      wifiEverConnected ? "reconectado" : "conectado", wifiAttempts,
+                      (unsigned long)((now - wifiDownSinceMs) / 1000), WiFi.localIP().toString().c_str(),
+                      (int)WiFi.RSSI(), queueCount, QUEUE_CAPACITY);
+        wifiEverConnected = true;
+        // Si el POST venia fallando (p. ej. backend apagado), se respeta su espera; si no, la cola se vacia ya.
+        if (postFailStreak == 0) nextPostAttemptMs = now;
+        return;
+    }
+
+    if (now - wifiDownSinceMs >= WIFI_RESTART_AFTER_MS || restartScanStarted) {
+        if (considerRestart()) return;
+    }
+
+    if ((int32_t)(now - nextWifiAttemptMs) >= 0) {
+        uint32_t waitMs = WIFI_BACKOFF_MS[stepIndex(wifiAttempts, WIFI_BACKOFF_STEPS)];
+        wifiAttempts++;
+        wifiGotIp = false;
+        WiFi.disconnect();
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        nextWifiAttemptMs = now + waitMs;
+        Serial.printf("[WIFI] intento %u de conexion | siguiente en %lu s | sin WiFi hace %lu s | cola %u/%u\n",
+                      wifiAttempts, (unsigned long)(waitMs / 1000), (unsigned long)((now - wifiDownSinceMs) / 1000),
+                      queueCount, QUEUE_CAPACITY);
+    }
+}
+
+// Valida la traza del ultimo reinicio: tras un encendido en frio RTC_NOINIT trae basura.
+void initRestartTrace() {
+    if (restartTrace.magic != RESTART_TRACE_MAGIC) {
+        memset(&restartTrace, 0, sizeof(restartTrace));
+        restartTrace.magic = RESTART_TRACE_MAGIC;
+        Serial.println("[WIFI] arranque en frio: contador de reinicios por WiFi en 0");
+        return;
+    }
+    if (restartTrace.pending && esp_reset_reason() == ESP_RST_SW) {
+        Serial.printf("[WIFI] arranque tras reinicio por falta de WiFi (#%lu desde el encendido; %lu lecturas perdidas)\n",
+                      (unsigned long)restartTrace.restarts, (unsigned long)restartTrace.lastLost);
+    }
+    restartTrace.pending = 0;
 }
 
 void setup() {
@@ -393,10 +559,16 @@ void setup() {
         Serial.println("ATENCION: no se detecto PMU (AXP2101/AXP192); la radio podria no estar alimentada");
     }
 
+    initRestartTrace();
+
+    // La conexion y las reconexiones las maneja maintainWifi() desde loop(), sin bloquear la radio.
     WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    Serial.printf("[wifi] conectando a \"%s\"...\n", WIFI_SSID);
+    WiFi.setAutoReconnect(false);
+    WiFi.onEvent(onWifiEvent);
+    wifiState = WIFI_DOWN;
+    wifiDownSinceMs = millis();
+    nextWifiAttemptMs = millis();
+    Serial.println("[WIFI] conectando (red configurada en secrets.h)");
 
     int16_t state = beginLoraRadio(radio);
     if (state != RADIOLIB_ERR_NONE) {
@@ -419,7 +591,7 @@ void setup() {
 void loop() {
     if (!radioReady) return;
 
-    logWifiChanges();
+    maintainWifi();
 
     if (radioIrq) {
         radioIrq = false;
@@ -435,10 +607,10 @@ void loop() {
     if (millis() - lastHeartbeatMs >= HEARTBEAT_INTERVAL_MS) {
         lastHeartbeatMs = millis();
         Serial.printf("[base] aceptados %lu | duplicados %lu | descartados %lu | cola %u/%u | "
-                      "POST ok %lu | reintentos %lu | rechazados %lu | WiFi %s\n",
+                      "descartadas por cola llena %lu | POST ok %lu | reintentos %lu | rechazados %lu | WiFi %s\n",
                       (unsigned long)packetsAccepted, (unsigned long)packetsDuplicated,
-                      (unsigned long)packetsRejected, queueCount, QUEUE_CAPACITY, (unsigned long)postsOk,
-                      (unsigned long)postsRetried, (unsigned long)postsDiscarded,
-                      WiFi.status() == WL_CONNECTED ? "OK" : "sin conexion");
+                      (unsigned long)packetsRejected, queueCount, QUEUE_CAPACITY, (unsigned long)queueDropped,
+                      (unsigned long)postsOk, (unsigned long)postsRetried, (unsigned long)postsDiscarded,
+                      wifiState == WIFI_UP ? "OK" : "sin conexion");
     }
 }
