@@ -1,4 +1,4 @@
-import { POLL_INTERVAL_MS, STATUS_COLORS } from '../config'
+import { STATUS_COLORS } from '../config'
 import { formatTime } from '../format'
 import { isConfirmedOutside, type HerdPosition } from '../hooks/useHerdPositions'
 import type { Geofence } from '../types'
@@ -19,36 +19,54 @@ export function Legend({ positions, lastUpdated, error, loading, geofence, geofe
   const withoutLocation = positions.filter((p) => p.location === null)
 
   return (
-    <aside className="legend">
-      <h2>Estado del hato</h2>
+    <aside className="legend" aria-live="polite">
+      <h2 className="legend-title">Estado del hato</h2>
 
-      <ul className="legend-status">
-        <li>
-          <span className="swatch" style={{ background: STATUS_COLORS.inside }} />
-          Dentro de la geocerca: <strong>{insideCount}</strong>
-        </li>
-        <li>
-          <span className="swatch" style={{ background: STATUS_COLORS.outside }} />
-          Fuera (salida confirmada): <strong>{outsideCount}</strong>
-        </li>
-      </ul>
+      <div className="legend-counts">
+        <div className="count" style={{ borderColor: STATUS_COLORS.inside }}>
+          <span className="count-value" style={{ color: STATUS_COLORS.inside }}>
+            {insideCount}
+          </span>
+          <span className="count-label">Dentro</span>
+        </div>
+        <div className="count" style={{ borderColor: STATUS_COLORS.outside }}>
+          <span className="count-value" style={{ color: STATUS_COLORS.outside }}>
+            {outsideCount}
+          </span>
+          <span className="count-label">Fuera</span>
+          <span className="count-hint">salida confirmada</span>
+        </div>
+      </div>
 
-      {withoutLocation.length > 0 && (
-        <p className="legend-note">
-          Sin ubicaciones todavía: {withoutLocation.map((p) => p.animal.tag_number).join(', ')}
+      <dl className="legend-info">
+        <dt>Geocerca</dt>
+        <dd>{geofence ? geofence.name : geofenceError ? 'no disponible por ahora' : 'cargando…'}</dd>
+        <dt>Última actualización</dt>
+        <dd>
+          <span className={error ? 'status-dot status-dot--error' : 'status-dot status-dot--ok'} />
+          {lastUpdated ? formatTime(lastUpdated) : '—'}
+        </dd>
+      </dl>
+
+      {loading && <p className="legend-message">Cargando datos…</p>}
+
+      {!loading && error && (
+        <p className="legend-message legend-message--error">
+          Sin conexión con el servidor. Mostrando los últimos datos; se reintenta automáticamente.
         </p>
       )}
 
-      <p className="legend-note">
-        Geocerca: {geofence ? geofence.name : geofenceError ? `no disponible (${geofenceError})` : 'cargando…'}
-      </p>
+      {!loading && !error && located.length === 0 && (
+        <p className="legend-message">
+          Aún no hay ubicaciones. El collar envía una lectura por minuto cuando tiene señal GPS.
+        </p>
+      )}
 
-      <p className={error ? 'legend-update legend-error' : 'legend-update'}>
-        {loading && 'Cargando datos…'}
-        {!loading && error && `No se pudo actualizar: ${error}.`}
-        {!loading && lastUpdated && ` Última actualización: ${formatTime(lastUpdated)}`}
-        {!loading && !error && ` (cada ${POLL_INTERVAL_MS / 1000} s)`}
-      </p>
+      {!loading && located.length > 0 && withoutLocation.length > 0 && (
+        <p className="legend-message">
+          Sin ubicaciones todavía: {withoutLocation.map((p) => p.animal.tag_number).join(', ')}
+        </p>
+      )}
     </aside>
   )
 }

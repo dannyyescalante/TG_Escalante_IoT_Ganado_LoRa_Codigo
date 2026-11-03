@@ -22,6 +22,7 @@ export interface LocationReading {
   recorded_at: string
   received_at: string
   inside_geofence: boolean
+  battery_percent: number | null
   created_at: string
 }
 
