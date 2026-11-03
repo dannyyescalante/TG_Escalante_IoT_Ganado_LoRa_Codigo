@@ -5,30 +5,29 @@ dotenv.config();
 
 /**
  * ============================================================================
- * GEOCERCA TEMPORAL DE PRUEBA — NO ES LA GEOCERCA REAL DE LA FINCA
+ * GEOCERCA REAL: potrero piloto de 1,29 ha de la finca en Garcia de Hevia.
  * ============================================================================
- * Cuadrado de 40 m x 40 m en San Cristobal, Tachira, usado para la prueba de
- * campo caminando con el collar en "Casa de Mafer" (centro 7.761292, -72.223944).
- * Se amplio a 40 m por lado porque el ruido del GPS NEO-6M (~7 m medido en campo)
- * generaria salidas falsas en un area mas pequena.
+ * Esquinas tomadas en campo el 2026-10-22 con el GPS de un celular (Google Maps),
+ * caminando la cerca. El area que encierran (~1,30 ha) coincide con la del mapa
+ * del dron (1,29 ha).
  *
- * Otra geocerca de prueba usada: cuadrilatero de ~1720 m2 en "Casa Danny"
- * (centro ~7.762124, -72.217737):
- *   POLYGON((-72.217501 7.762129, -72.217624 7.761883, -72.217980 7.762036,
- *            -72.217808 7.762436, -72.217501 7.762129))
- *
- * DEBE reemplazarse por el poligono real del corral piloto en Garcia de Hevia
- * cuando se capturen sus coordenadas en campo.
+ * Geocercas de prueba usadas antes (quedan inactivas en la BD como historial):
+ *   "Casa de Mafer": cuadrado de 40 m x 40 m (centro 7.761292, -72.223944):
+ *     POLYGON((-72.224126 7.761111, -72.224126 7.761473, -72.223763 7.761473,
+ *              -72.223763 7.761111, -72.224126 7.761111))
+ *   "Casa Danny": cuadrilatero de ~1720 m2 (centro ~7.762124, -72.217737):
+ *     POLYGON((-72.217501 7.762129, -72.217624 7.761883, -72.217980 7.762036,
+ *              -72.217808 7.762436, -72.217501 7.762129))
  * ============================================================================
  */
-const GEOFENCE_NAME = "Prueba de campo - Casa de Mafer (TEMPORAL)";
+const GEOFENCE_NAME = "Potrero piloto 1,29 ha - Finca (Garcia de Hevia)";
 const GEOFENCE_WKT =
     "POLYGON((" +
-    "-72.224126 7.761111, " +
-    "-72.224126 7.761473, " +
-    "-72.223763 7.761473, " +
-    "-72.223763 7.761111, " +
-    "-72.224126 7.761111" +
+    "-72.2806507 8.2319457, " +
+    "-72.281143 8.232250, " +
+    "-72.280340 8.233782, " +
+    "-72.279788 8.233369, " +
+    "-72.2806507 8.2319457" +
     "))";
 
 async function seedGeofence(): Promise<void> {
