@@ -38,6 +38,7 @@ export interface GeofenceEvent {
   tag_number: string
   animal_name: string | null
   location_id: string
+  geofence_id: number
   event_type: 'exit' | 'enter'
   occurred_at: string
   created_at: string

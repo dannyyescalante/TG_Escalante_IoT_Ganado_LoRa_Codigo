@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { pool } from "../config/database";
+import { sendInternalError } from "../http/errors";
 
 export const geofenceRouter = Router();
 
@@ -23,6 +24,6 @@ geofenceRouter.get("/", async (_req: Request, res: Response) => {
 
         res.json(result.rows[0]);
     } catch (err) {
-        res.status(500).json({ status: "error", message: (err as Error).message });
+        sendInternalError(res, err);
     }
 });
