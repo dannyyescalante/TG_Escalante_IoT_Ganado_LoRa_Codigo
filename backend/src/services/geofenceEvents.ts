@@ -28,6 +28,9 @@ interface EvaluateGeofenceTransitionParams {
  * (el evento mas reciente del animal indica si ya hay un exit sin resolver).
  * Ambas busquedas se limitan a la misma geocerca: inside_geofence de poligonos
  * distintos no es comparable, asi que al cambiar de geocerca la evaluacion empieza de cero.
+ * Lecturas atrasadas (llegan despues de otras mas nuevas): la "anterior" es la
+ * inmediatamente anterior en el tiempo GPS, no la ultima recibida, y si ya hay un
+ * evento posterior a esta lectura no se genera ninguno (ese tramo ya se evaluo).
  */
 export async function evaluateGeofenceTransition(
     params: EvaluateGeofenceTransitionParams
@@ -37,10 +40,10 @@ export async function evaluateGeofenceTransition(
     const previousResult = await pool.query(
         `SELECT inside_geofence
          FROM locations
-         WHERE animal_id = $1 AND geofence_id = $2 AND id <> $3
+         WHERE animal_id = $1 AND geofence_id = $2 AND recorded_at < $3
          ORDER BY recorded_at DESC, id DESC
          LIMIT 1`,
-        [animalId, geofenceId, locationId]
+        [animalId, geofenceId, recordedAt]
     );
 
     if (previousResult.rowCount === 0) {
@@ -53,14 +56,17 @@ export async function evaluateGeofenceTransition(
     }
 
     const latestEventResult = await pool.query(
-        `SELECT ge.event_type
+        `SELECT ge.event_type, ge.occurred_at > $3 AS is_after_reading
          FROM geofence_events ge
          JOIN locations l ON l.id = ge.location_id
          WHERE l.animal_id = $1 AND ge.geofence_id = $2
          ORDER BY ge.occurred_at DESC, ge.id DESC
          LIMIT 1`,
-        [animalId, geofenceId]
+        [animalId, geofenceId, recordedAt]
     );
+    if (latestEventResult.rows[0]?.is_after_reading) {
+        return null;
+    }
     const latestEventType: GeofenceEventType | null = latestEventResult.rows[0]?.event_type ?? null;
 
     let eventTypeToInsert: GeofenceEventType | null = null;

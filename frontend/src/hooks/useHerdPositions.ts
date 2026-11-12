@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { getAnimals, getEvents, getLatestLocation } from '../api/client'
+import { getAnimals, getEvents, getGeofence, getLatestLocation } from '../api/client'
 import { POLL_INTERVAL_MS } from '../config'
 import type { Animal, GeofenceEvent, LocationReading } from '../types'
 
@@ -23,13 +23,14 @@ export function isConfirmedOutside(position: HerdPosition): boolean {
 }
 
 async function fetchHerdPositions(): Promise<HerdPosition[]> {
-  const [animals, events] = await Promise.all([getAnimals(), getEvents()])
+  const [animals, events, geofence] = await Promise.all([getAnimals(), getEvents(), getGeofence()])
   const activeAnimals = animals.filter((animal) => animal.is_active)
 
   // /events viene ordenado por occurred_at DESC: el primero de cada animal es su evento mas reciente.
+  // Solo cuentan los de la geocerca activa: un exit de una geocerca anterior no dice nada de la actual.
   const lastEventByAnimal = new Map<number, GeofenceEvent>()
   for (const event of events) {
-    if (!lastEventByAnimal.has(event.animal_id)) {
+    if (event.geofence_id === geofence.id && !lastEventByAnimal.has(event.animal_id)) {
       lastEventByAnimal.set(event.animal_id, event)
     }
   }

@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { pool } from "../config/database";
+import { sendInternalError } from "../http/errors";
 import { evaluateGeofenceTransition } from "../services/geofenceEvents";
 
 export const locationsRouter = Router();
@@ -17,7 +18,8 @@ function isValidLongitude(value: unknown): value is number {
 }
 
 function parsePositiveInt(raw: string): number | null {
-    if (!/^\d+$/.test(raw)) return null;
+    // Sin ceros a la izquierda y mayor que 0: "0" (o "00") no es un entero positivo.
+    if (!/^[1-9]\d*$/.test(raw)) return null;
     return Number(raw);
 }
 
@@ -28,6 +30,10 @@ function isOptionalNumberInRange(value: unknown, min: number, max: number, integ
     if (integer && !Number.isInteger(value)) return false;
     return value >= min && value <= max;
 }
+
+// Margen para la diferencia entre la hora GPS del collar y el reloj del PC del backend.
+// Una lectura "del futuro" pasaria a ser la mas reciente y las reales se verian como atrasadas.
+const MAX_CLOCK_AHEAD_MS = 5 * 60 * 1000;
 
 const LOCATION_COLUMNS = `id, animal_id, geofence_id, ST_Y(geom) AS lat, ST_X(geom) AS lon,
     recorded_at, received_at, inside_geofence, battery_percent, satellites, packet_seq,
@@ -46,6 +52,8 @@ locationsRouter.post("/", async (req: Request, res: Response) => {
     if (!isValidLongitude(lon)) errors.push("lon es requerido y debe ser un numero entre -180 y 180.");
     if (!isNonEmptyString(timestamp) || Number.isNaN(Date.parse(timestamp))) {
         errors.push("timestamp es requerido y debe ser una fecha valida (ISO 8601).");
+    } else if (Date.parse(timestamp) > Date.now() + MAX_CLOCK_AHEAD_MS) {
+        errors.push("timestamp no puede estar mas de 5 minutos por delante del reloj del servidor.");
     }
     if (!isOptionalNumberInRange(battery_percent, 0, 100, true)) {
         errors.push("battery_percent es opcional; si se envia debe ser un entero entre 0 y 100 o null.");
@@ -69,7 +77,7 @@ locationsRouter.post("/", async (req: Request, res: Response) => {
 
     try {
         const animalResult = await pool.query(
-            "SELECT id FROM animals WHERE collar_device_id = $1",
+            "SELECT id, is_active FROM animals WHERE collar_device_id = $1",
             [collar_device_id.trim()]
         );
 
@@ -81,6 +89,7 @@ locationsRouter.post("/", async (req: Request, res: Response) => {
         }
 
         const animalId = animalResult.rows[0].id;
+        const animalIsActive: boolean = animalResult.rows[0].is_active;
 
         const geofenceResult = await pool.query("SELECT id FROM geofence WHERE is_active");
         if (geofenceResult.rowCount === 0) {
@@ -130,6 +139,11 @@ locationsRouter.post("/", async (req: Request, res: Response) => {
 
         const location = insertResult.rows[0];
 
+        // Animal inactivo: la lectura se guarda (trazabilidad) pero no genera eventos ni alertas.
+        if (!animalIsActive) {
+            return res.status(201).json({ ...location, geofence_event: null });
+        }
+
         const geofenceEvent = await evaluateGeofenceTransition({
             animalId: location.animal_id,
             geofenceId: location.geofence_id,
@@ -140,7 +154,7 @@ locationsRouter.post("/", async (req: Request, res: Response) => {
 
         res.status(201).json({ ...location, geofence_event: geofenceEvent });
     } catch (err) {
-        res.status(500).json({ status: "error", message: (err as Error).message });
+        sendInternalError(res, err);
     }
 });
 
@@ -177,6 +191,6 @@ locationsRouter.get("/:animalId", async (req: Request, res: Response) => {
 
         res.json(locationsResult.rows);
     } catch (err) {
-        res.status(500).json({ status: "error", message: (err as Error).message });
+        sendInternalError(res, err);
     }
 });

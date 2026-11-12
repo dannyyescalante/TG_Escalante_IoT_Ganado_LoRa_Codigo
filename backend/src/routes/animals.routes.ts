@@ -1,5 +1,6 @@
 import { Router, Request, Response } from "express";
 import { pool } from "../config/database";
+import { sendInternalError } from "../http/errors";
 
 export const animalsRouter = Router();
 
@@ -22,7 +23,7 @@ animalsRouter.get("/", async (_req: Request, res: Response) => {
         const result = await pool.query("SELECT * FROM animals ORDER BY id");
         res.json(result.rows);
     } catch (err) {
-        res.status(500).json({ status: "error", message: (err as Error).message });
+        sendInternalError(res, err);
     }
 });
 
@@ -40,7 +41,7 @@ animalsRouter.get("/:id", async (req: Request, res: Response) => {
         }
         res.json(result.rows[0]);
     } catch (err) {
-        res.status(500).json({ status: "error", message: (err as Error).message });
+        sendInternalError(res, err);
     }
 });
 
@@ -80,7 +81,7 @@ animalsRouter.post("/", async (req: Request, res: Response) => {
                 message: "Ya existe un animal con ese tag_number o collar_device_id.",
             });
         }
-        res.status(500).json({ status: "error", message: (err as Error).message });
+        sendInternalError(res, err);
     }
 });
 
@@ -155,6 +156,6 @@ animalsRouter.put("/:id", async (req: Request, res: Response) => {
                 message: "Ya existe un animal con ese tag_number o collar_device_id.",
             });
         }
-        res.status(500).json({ status: "error", message: (err as Error).message });
+        sendInternalError(res, err);
     }
 });
