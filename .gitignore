@@ -22,9 +22,6 @@ build/
 *.log
 npm-debug.log*
 
-# Claude Code - configuracion y datos locales del asistente (no se sube al repo)
-.claude/
-
 # Editor / IDE
 .vscode/
 .idea/
